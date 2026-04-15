@@ -1,0 +1,40 @@
+{
+  "entities": {
+    "Booking": {
+      "title": "Booking",
+      "description": "A barber shop booking record",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "whatsapp": { "type": "string" },
+        "service": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "time": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "completed", "no-show"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "price": { "type": "number" }
+      },
+      "required": ["name", "whatsapp", "service", "date", "time", "status", "createdAt"]
+    },
+    "Settings": {
+      "title": "Settings",
+      "description": "Global shop settings",
+      "type": "object",
+      "properties": {
+        "isOpen": { "type": "boolean" }
+      },
+      "required": ["isOpen"]
+    }
+  },
+  "firestore": {
+    "/bookings/{bookingId}": {
+      "schema": "Booking",
+      "description": "Customer bookings"
+    },
+    "/settings/shop": {
+      "schema": "Settings",
+      "description": "Shop operational status"
+    }
+  }
+}
