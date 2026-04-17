@@ -40,7 +40,16 @@ import {
   Download,
   ExternalLink,
   Menu,
-  X
+  X,
+  ArrowUpDown,
+  ChevronUp,
+  ChevronDown,
+  Info,
+  AlertTriangle,
+  FileText,
+  Save,
+  Edit,
+  Bell
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -52,9 +61,94 @@ import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Toaster } from '@/components/ui/sonner';
 import { toast } from 'sonner';
-import { format, isToday, parseISO, isWithinInterval, setHours, setMinutes } from 'date-fns';
+import { 
+  format, 
+  isToday, 
+  parseISO, 
+  isWithinInterval, 
+  setHours, 
+  setMinutes,
+  addMinutes,
+  parse,
+  isBefore,
+  isAfter,
+  isEqual
+} from 'date-fns';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import confetti from 'canvas-confetti';
+
+// --- Firestore Error Handling ---
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  toast.error(`Permission Denied: ${operationType} on ${path}`);
+  throw new Error(JSON.stringify(errInfo));
+}
+
+function ErrorBoundary({ children }: { children: React.ReactNode }) {
+  const [errorState, setErrorState] = useState<{ hasError: boolean, error: Error | null }>({ hasError: false, error: null });
+
+  useEffect(() => {
+    const errorHandler = (error: ErrorEvent) => {
+      setErrorState({ hasError: true, error: error.error });
+    };
+    window.addEventListener('error', errorHandler);
+    return () => window.removeEventListener('error', errorHandler);
+  }, []);
+
+  if (errorState.hasError) {
+    let message = "Something went wrong.";
+    try {
+      const info = JSON.parse(errorState.error?.message || "{}");
+      if (info.error) message = `Firestore Error: ${info.error}`;
+    } catch (e) {}
+    
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center p-4">
+        <Card className="bg-[#111] border-red-500 p-8 max-w-md text-center space-y-4">
+          <XCircle className="w-12 h-12 text-red-500 mx-auto" />
+          <h2 className="text-xl font-bold text-white">Application Error</h2>
+          <p className="text-muted-foreground text-sm">{message}</p>
+          <Button onClick={() => window.location.reload()} className="bg-gold text-black font-bold">
+            Reload Application
+          </Button>
+        </Card>
+      </div>
+    );
+  }
+  return <>{children}</>;
+}
 
 // --- Types ---
 interface Booking {
@@ -64,9 +158,10 @@ interface Booking {
   service: string;
   date: string;
   time: string;
-  status: 'pending' | 'completed' | 'no-show';
+  status: 'pending' | 'completed' | 'no-show' | 'cancelled';
   createdAt: any;
   price: number;
+  duration: number;
 }
 
 interface ShopSettings {
@@ -74,15 +169,15 @@ interface ShopSettings {
 }
 
 const SERVICES = [
-  { name: 'Anak', price: 35000 },
-  { name: 'Dewasa', price: 50000 },
-  { name: 'Semir Uban', price: 50000 },
-  { name: 'Downperm', price: 120000 },
-  { name: 'Keratin', price: 200000 },
-  { name: 'Perming Curly/Wavy', price: 250000 },
-  { name: 'Hairlight', price: 180000 }, // Range 160-200, used avg
-  { name: 'Coloring Full', price: 225000 }, // Range 200-250, used avg
-  { name: 'Cornrows', price: 400000 }, // Range 300-500, used avg
+  { name: 'Anak', price: 35000, duration: 30 },
+  { name: 'Dewasa', price: 50000, duration: 45 },
+  { name: 'Semir Uban', price: 50000, duration: 30 },
+  { name: 'Downperm', price: 120000, duration: 60 },
+  { name: 'Keratin', price: 200000, duration: 90 },
+  { name: 'Perming Curly/Wavy', price: 250000, duration: 120 },
+  { name: 'Hairlight', price: 180000, duration: 90 },
+  { name: 'Coloring Full', price: 225000, duration: 90 },
+  { name: 'Cornrows', price: 400000, duration: 180 },
 ];
 
 const ADMIN_EMAILS = ["skullstudio09@gmail.com", "viciknopik14@gmail.com"];
@@ -96,8 +191,51 @@ export default function App() {
   const [view, setView] = useState<'customer' | 'admin'>('customer');
   const [lastBooking, setLastBooking] = useState<Booking | null>(null);
   const [showTicket, setShowTicket] = useState(false);
+  const [showPolicy, setShowPolicy] = useState(false);
+  const [showNotes, setShowNotes] = useState<{ open: boolean, client: any }>({ open: false, client: null });
+  const [editingBooking, setEditingBooking] = useState<Booking | null>(null);
+  const [clientNotes, setClientNotes] = useState<Record<string, string>>({});
+  const [selectedDate, setSelectedDate] = useState(format(new Date(), 'yyyy-MM-dd'));
+  const [selectedService, setSelectedService] = useState('');
+  const [selectedTime, setSelectedTime] = useState('');
+  const [dateBookings, setDateBookings] = useState<Booking[]>([]);
+  const [notifications, setNotifications] = useState<{id: string, message: string, time: Date}[]>([]);
+  const [noteContent, setNoteContent] = useState('');
+  const [clientSort, setClientSort] = useState<{ key: string, direction: 'asc' | 'desc' }>({ key: 'totalBookings', direction: 'desc' });
+  const [currentTime, setCurrentTime] = useState(new Date());
 
   // --- Auth & Initial Data ---
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 60000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(collection(db, 'clientNotes'), (snapshot) => {
+      const notes: Record<string, string> = {};
+      snapshot.docs.forEach(doc => {
+        notes[doc.id] = doc.data().note;
+      });
+      setClientNotes(notes);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'clientNotes');
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    const q = query(collection(db, 'bookings'), where('date', '==', selectedDate));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Booking));
+      setDateBookings(data);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'bookings_by_date');
+    });
+    return () => unsubscribe();
+  }, [selectedDate]);
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
       setUser(u);
@@ -116,9 +254,21 @@ export default function App() {
         const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
         audio.play().catch(() => {});
         toast.success('New booking received!');
+        
+        const newDoc = snapshot.docChanges().find(change => change.type === 'added');
+        if (newDoc) {
+          const booking = newDoc.doc.data() as Booking;
+          setNotifications(prev => [{
+            id: newDoc.doc.id,
+            message: `New booking: ${booking.name} for ${booking.service}`,
+            time: new Date()
+          }, ...prev].slice(0, 10)); // Keep last 10
+        }
       }
       
       setBookings(data);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'bookings');
     });
     return () => unsubscribe();
   }, [bookings.length]);
@@ -127,14 +277,38 @@ export default function App() {
     const unsubscribe = onSnapshot(doc(db, 'settings', 'shop'), (snapshot) => {
       if (snapshot.exists()) {
         setSettings(snapshot.data() as ShopSettings);
-      } else {
-        setDoc(doc(db, 'settings', 'shop'), { isOpen: true });
+      } else if (isAdmin && auth.currentUser) {
+        // Only admins should attempt to initialize the settings document
+        // and only if we are sure they are logged in
+        setDoc(doc(db, 'settings', 'shop'), { isOpen: true }).catch(err => {
+          // If it's a permission error, we might not be fully authorized yet
+          if (err.code !== 'permission-denied') {
+            handleFirestoreError(err, OperationType.WRITE, 'settings/shop');
+          }
+        });
+      }
+    }, (error) => {
+      // Customers can read, but if the doc doesn't exist, some SDK versions might throw
+      // We only care about errors for admins who should have access
+      if (isAdmin && error.code !== 'permission-denied') {
+        handleFirestoreError(error, OperationType.GET, 'settings/shop');
       }
     });
     return () => unsubscribe();
-  }, []);
+  }, [isAdmin, user]); // Depend on both for safety
 
   // --- Handlers ---
+  const handleLogin = async () => {
+    try {
+      await signInWithGoogle();
+    } catch (error: any) {
+      if (error.code !== 'auth/popup-closed-by-user') {
+        console.error('Login error:', error);
+        toast.error('Login failed. Please try again.');
+      }
+    }
+  };
+
   const handleBooking = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!settings.isOpen) {
@@ -143,18 +317,68 @@ export default function App() {
     }
 
     const formData = new FormData(e.currentTarget);
-    const serviceName = formData.get('service') as string;
+    const serviceName = selectedService;
+    const date = selectedDate;
+    const time = selectedTime;
+    
+    if (!serviceName || !date || !time) {
+      toast.error('Please complete all booking information.');
+      return;
+    }
+
     const service = SERVICES.find(s => s.name === serviceName);
     
+    if (!service) return;
+
+    // --- Capacity Validation (Max 2 people) ---
+    const proposedStart = parse(`${date} ${time}`, 'yyyy-MM-dd HH:mm', new Date());
+    const proposedEnd = addMinutes(proposedStart, service.duration);
+
+    // Check for overlaps with existing pending bookings
+    // Use the potentially more up-to-date bookings state or dateBookings
+    const overlappingBookings = dateBookings.filter(b => {
+      if (b.status !== 'pending') return false;
+      
+      const bStart = parse(`${b.date} ${b.time}`, 'yyyy-MM-dd HH:mm', new Date());
+      const bEnd = addMinutes(bStart, b.duration || 30);
+
+      // Interval overlap check: (StartA < EndB) and (StartB < EndA)
+      return isBefore(proposedStart, bEnd) && isBefore(bStart, proposedEnd);
+    });
+
+    // Check capacity at discrete points (start times of all involved bookings)
+    const pointsToCheck = [proposedStart, ...overlappingBookings.map(b => parse(`${b.date} ${b.time}`, 'yyyy-MM-dd HH:mm', new Date()))];
+    
+    const isFull = pointsToCheck.some(point => {
+      // Don't check points outside our proposed interval
+      if (isBefore(point, proposedStart) || isAfter(point, addMinutes(proposedStart, service.duration - 1))) {
+        return false;
+      }
+
+      const concurrentCount = overlappingBookings.filter(b => {
+        const bStart = parse(`${b.date} ${b.time}`, 'yyyy-MM-dd HH:mm', new Date());
+        const bEnd = addMinutes(bStart, b.duration || 30);
+        return (isEqual(point, bStart) || isAfter(point, bStart)) && isBefore(point, bEnd);
+      }).length;
+
+      return concurrentCount >= 2;
+    });
+
+    if (isFull) {
+      toast.error('Maaf, slot jam ini sudah penuh (Maksimal 2 orang). Silakan pilih jam lain.');
+      return;
+    }
+
     const bookingData = {
       name: formData.get('name'),
       whatsapp: formData.get('whatsapp'),
       service: serviceName,
-      date: formData.get('date'),
-      time: formData.get('time'),
+      date,
+      time,
       status: 'pending',
       createdAt: serverTimestamp(),
-      price: service?.price || 0
+      price: service.price,
+      duration: service.duration
     };
 
     try {
@@ -162,6 +386,7 @@ export default function App() {
       const newBooking = { id: docRef.id, ...bookingData } as Booking;
       setLastBooking(newBooking);
       setShowTicket(true);
+
       confetti({
         particleCount: 100,
         spread: 70,
@@ -175,18 +400,19 @@ export default function App() {
       window.open(waUrl, '_blank');
       
       (e.target as HTMLFormElement).reset();
+      setSelectedService('');
+      setSelectedTime('');
     } catch (error) {
-      toast.error('Failed to book. Please try again.');
-      console.error(error);
+      handleFirestoreError(error, OperationType.CREATE, 'bookings');
     }
   };
 
-  const updateBookingStatus = async (id: string, status: 'completed' | 'no-show') => {
+  const updateBookingStatus = async (id: string, status: 'completed' | 'no-show' | 'cancelled') => {
     try {
       await updateDoc(doc(db, 'bookings', id), { status });
       toast.success(`Booking marked as ${status}`);
     } catch (error) {
-      toast.error('Update failed');
+      handleFirestoreError(error, OperationType.UPDATE, `bookings/${id}`);
     }
   };
 
@@ -195,11 +421,95 @@ export default function App() {
       await updateDoc(doc(db, 'settings', 'shop'), { isOpen: !settings.isOpen });
       toast.success(`Studio is now ${!settings.isOpen ? 'OPEN' : 'CLOSED'}`);
     } catch (error) {
-      toast.error('Failed to update status');
+      handleFirestoreError(error, OperationType.UPDATE, 'settings/shop');
+    }
+  };
+
+  const handleUpdateBooking = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!editingBooking) return;
+
+    const formData = new FormData(e.currentTarget);
+    const serviceName = formData.get('service') as string;
+    const date = formData.get('date') as string;
+    const time = formData.get('time') as string;
+    const status = formData.get('status') as string;
+    const service = SERVICES.find(s => s.name === serviceName);
+
+    if (!service) return;
+
+    try {
+      await updateDoc(doc(db, 'bookings', editingBooking.id), {
+        service: serviceName,
+        date,
+        time,
+        status,
+        price: service.price,
+        duration: service.duration
+      });
+      toast.success('Booking updated successfully');
+      setEditingBooking(null);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `bookings/${editingBooking.id}`);
     }
   };
 
   // --- Stats ---
+  const handleUpdateNote = async () => {
+    if (!showNotes.client) return;
+    try {
+      await setDoc(doc(db, 'clientNotes', showNotes.client.whatsapp), {
+        note: noteContent,
+        updatedAt: serverTimestamp()
+      });
+      toast.success('Note updated');
+      setShowNotes({ open: false, client: null });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `clientNotes/${showNotes.client.whatsapp}`);
+    }
+  };
+
+  const clients = useMemo(() => {
+    const clientMap = new Map();
+    bookings.forEach(b => {
+      const key = b.whatsapp;
+      if (!clientMap.has(key)) {
+        clientMap.set(key, {
+          name: b.name,
+          whatsapp: b.whatsapp,
+          totalBookings: 0,
+          totalSpent: 0,
+          lastBooking: b.date,
+          history: []
+        });
+      }
+      const client = clientMap.get(key);
+      client.totalBookings++;
+      if (b.status === 'completed') {
+        client.totalSpent += b.price;
+      }
+      if (new Date(b.date) > new Date(client.lastBooking)) {
+        client.lastBooking = b.date;
+      }
+      client.history.push(b);
+    });
+    
+    const clientList = Array.from(clientMap.values());
+    
+    return clientList.sort((a: any, b: any) => {
+      const { key, direction } = clientSort;
+      let valA = a[key];
+      let valB = b[key];
+      
+      if (typeof valA === 'string') valA = valA.toLowerCase();
+      if (typeof valB === 'string') valB = valB.toLowerCase();
+      
+      if (valA < valB) return direction === 'asc' ? -1 : 1;
+      if (valA > valB) return direction === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }, [bookings, clientSort]);
+
   const stats = useMemo(() => {
     const todayBookings = bookings.filter(b => b.date === format(new Date(), 'yyyy-MM-dd'));
     const totalRevenue = bookings.filter(b => b.status === 'completed').reduce((acc, b) => acc + b.price, 0);
@@ -218,6 +528,45 @@ export default function App() {
   }, [bookings]);
 
   // --- UI Components ---
+  const timeSlots = useMemo(() => {
+    const isFriday = new Date(selectedDate).getDay() === 5;
+    const startHour = isFriday ? 13 : 10;
+    const endHour = 22;
+    
+    const slots = [];
+    for (let h = startHour; h < endHour; h++) {
+      slots.push(`${h.toString().padStart(2, '0')}:00`);
+      slots.push(`${h.toString().padStart(2, '0')}:30`);
+    }
+    return slots;
+  }, [selectedDate]);
+
+  const estimatedEndTime = useMemo(() => {
+    if (!selectedService || !selectedTime) return null;
+    const service = SERVICES.find(s => s.name === selectedService);
+    if (!service) return null;
+    try {
+      const startTime = parse(selectedTime, 'HH:mm', new Date());
+      return format(addMinutes(startTime, service.duration), 'HH:mm');
+    } catch {
+      return null;
+    }
+  }, [selectedService, selectedTime]);
+
+  const getSlotStatus = (slotTimeStr: string) => {
+    const slotDate = parse(`${selectedDate} ${slotTimeStr}`, 'yyyy-MM-dd HH:mm', new Date());
+    
+    const concurrentCount = dateBookings.filter(b => {
+      // Only count active bookings (pending/completed) that cover this slot
+      if (b.status === 'cancelled' || b.status === 'no-show') return false;
+      const bStart = parse(`${b.date} ${b.time}`, 'yyyy-MM-dd HH:mm', new Date());
+      const bEnd = addMinutes(bStart, b.duration || 30);
+      return (isEqual(slotDate, bStart) || isAfter(slotDate, bStart)) && isBefore(slotDate, bEnd);
+    }).length;
+
+    return concurrentCount;
+  };
+
   const TopBar = () => (
     <header className="top-bar">
       <div className="flex items-center gap-[15px]">
@@ -239,9 +588,12 @@ export default function App() {
           <h3 className="sidebar-title">Our Services</h3>
           <div className="space-y-2">
             {SERVICES.map(s => (
-              <div key={s.name} className="service-item">
-                <span>{s.name}</span>
-                <span className="font-bold text-gold">{(s.price / 1000)}K</span>
+              <div key={s.name} className="service-item flex-col items-start !gap-0">
+                <div className="flex justify-between w-full">
+                  <span>{s.name}</span>
+                  <span className="font-bold text-gold">{(s.price / 1000)}K</span>
+                </div>
+                <span className="text-[10px] text-zinc-500 uppercase tracking-tighter">Duration: {s.duration} mins</span>
               </div>
             ))}
           </div>
@@ -271,33 +623,87 @@ export default function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-1">
                   <Label className="text-[11px] uppercase text-gold font-semibold">Service</Label>
-                  <Select name="service" required>
+                  <Select value={selectedService} onValueChange={setSelectedService} required>
                     <SelectTrigger className="bg-black border-[#333] text-white h-12 focus:border-gold">
                       <SelectValue placeholder="Select service" />
                     </SelectTrigger>
                     <SelectContent className="bg-zinc-900 border-[#333]">
                       {SERVICES.map(s => (
                         <SelectItem key={s.name} value={s.name}>
-                          {s.name} ({(s.price / 1000)}K)
+                          {s.name} ({(s.price / 1000)}K - {s.duration}m)
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="space-y-1">
-                    <Label className="text-[11px] uppercase text-gold font-semibold">Date</Label>
-                    <Input name="date" type="date" min={format(new Date(), 'yyyy-MM-dd')} required className="bg-black border-[#333] text-white h-12 focus:border-gold p-2" />
-                  </div>
-                  <div className="space-y-1">
-                    <Label className="text-[11px] uppercase text-gold font-semibold">Time</Label>
-                    <Input name="time" type="time" required className="bg-black border-[#333] text-white h-12 focus:border-gold p-2" />
-                  </div>
+                <div className="space-y-1">
+                  <Label className="text-[11px] uppercase text-gold font-semibold">Date</Label>
+                  <Input 
+                    type="date" 
+                    min={format(new Date(), 'yyyy-MM-dd')} 
+                    value={selectedDate}
+                    onChange={(e) => {
+                      setSelectedDate(e.target.value);
+                      setSelectedTime(''); // Reset time when date changes
+                    }}
+                    required 
+                    className="bg-black border-[#333] text-white h-12 focus:border-gold p-2" 
+                  />
                 </div>
               </div>
-              <Button type="submit" disabled={!settings.isOpen} className="w-full bg-gold text-black font-black uppercase tracking-widest h-14 rounded-sm hover:bg-gold/90 transition-all mt-4">
+
+              <div className="space-y-3">
+                <div className="flex justify-between items-center">
+                  <Label className="text-[11px] uppercase text-gold font-semibold">Available Time Slots</Label>
+                  {estimatedEndTime && (
+                    <span className="text-[10px] text-zinc-500 font-bold uppercase">
+                      Finish Est: <span className="text-gold">{estimatedEndTime}</span>
+                    </span>
+                  )}
+                </div>
+                
+                <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-4 xl:grid-cols-6 gap-2">
+                  {timeSlots.map(slot => {
+                    const count = getSlotStatus(slot);
+                    const isFull = count >= 2;
+                    const isSelected = selectedTime === slot;
+                    
+                    return (
+                      <button
+                        key={slot}
+                        type="button"
+                        disabled={isFull}
+                        onClick={() => setSelectedTime(slot)}
+                        className={`
+                          relative py-3 rounded-sm text-xs font-bold transition-all border flex items-center justify-center gap-1
+                          ${isSelected 
+                            ? 'bg-gold text-black border-gold shadow-[0_0_20px_rgba(212,175,55,0.4)] scale-105 z-10' 
+                            : isFull 
+                              ? 'bg-zinc-900/50 text-zinc-700 border-[#222] cursor-not-allowed' 
+                              : 'bg-black text-white border-[#333] hover:border-gold/50 hover:bg-white/5'
+                          }
+                        `}
+                      >
+                        {isSelected && <CheckCircle2 className="w-3 h-3" />}
+                        {slot}
+                        {isFull ? (
+                          <span className="absolute -top-1 -right-1 bg-red-600 text-[8px] px-1.5 py-0.5 rounded-sm text-white font-black border border-red-400 shadow-lg uppercase">Full</span>
+                        ) : count === 1 ? (
+                          <span className="absolute -top-1 -right-1 bg-zinc-800 text-[7px] px-1 rounded-sm text-gold border border-gold/30">1 Slot</span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <Button type="submit" disabled={!settings.isOpen || !selectedTime} className="w-full bg-gold text-black font-black uppercase tracking-widest h-14 rounded-sm hover:bg-gold/90 transition-all mt-4">
                 {settings.isOpen ? "Confirm Reservation" : "Studio Closed"}
               </Button>
+              <div className="flex justify-center items-center gap-2 mt-4 text-[10px] text-zinc-500">
+                <Info className="w-3 h-3 text-gold" />
+                <span>Read our <button type="button" onClick={() => setShowPolicy(true)} className="text-gold underline hover:text-gold/80 transition-colors">Cancellation Policy</button> before booking.</span>
+              </div>
             </form>
           </Card>
         </div>
@@ -335,6 +741,104 @@ export default function App() {
       </main>
     </div>
   );
+
+  const ClientsView = () => {
+    const handleSort = (key: string) => {
+      setClientSort(prev => ({
+        key,
+        direction: prev.key === key && prev.direction === 'desc' ? 'asc' : 'desc'
+      }));
+    };
+
+    const SortIcon = ({ column }: { column: string }) => {
+      if (clientSort.key !== column) return <ArrowUpDown className="w-3 h-3 ml-1 opacity-30" />;
+      return clientSort.direction === 'asc' ? <ChevronUp className="w-3 h-3 ml-1 text-gold" /> : <ChevronDown className="w-3 h-3 ml-1 text-gold" />;
+    };
+
+    return (
+      <div className="pt-6 space-y-6">
+        <div className="flex justify-between items-center">
+          <h3 className="sidebar-title">Client Database ({clients.length})</h3>
+        </div>
+        <Card className="bg-[#111] border-[#333] overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12px]">
+              <thead>
+                <tr className="bg-black border-b border-[#333] text-gold uppercase tracking-widest font-bold">
+                  <th 
+                    className="p-4 text-left cursor-pointer hover:bg-white/5 transition-colors"
+                    onClick={() => handleSort('name')}
+                  >
+                    <div className="flex items-center">
+                      Client Name <SortIcon column="name" />
+                    </div>
+                  </th>
+                  <th className="p-4 text-left">WhatsApp</th>
+                  <th 
+                    className="p-4 text-center cursor-pointer hover:bg-white/5 transition-colors"
+                    onClick={() => handleSort('totalBookings')}
+                  >
+                    <div className="flex items-center justify-center">
+                      Visits <SortIcon column="totalBookings" />
+                    </div>
+                  </th>
+                  <th className="p-4 text-left">Last Visit</th>
+                  <th 
+                    className="p-4 text-right cursor-pointer hover:bg-white/5 transition-colors"
+                    onClick={() => handleSort('totalSpent')}
+                  >
+                    <div className="flex items-center justify-end">
+                      Total Spent <SortIcon column="totalSpent" />
+                    </div>
+                  </th>
+                  <th className="p-4 text-center">Notes</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#222]">
+                {clients.map((c) => (
+                  <tr key={c.whatsapp} className="hover:bg-white/5 transition-colors">
+                    <td className="p-4 font-bold uppercase">{c.name}</td>
+                    <td className="p-4 text-muted-foreground">
+                      <a href={`https://wa.me/${c.whatsapp}`} target="_blank" rel="noreferrer" className="flex items-center gap-2 hover:text-gold transition-colors">
+                        <Phone className="w-3 h-3" /> {c.whatsapp}
+                      </a>
+                    </td>
+                    <td className="p-4 text-center">
+                      <Badge variant="outline" className="border-gold text-gold font-bold">
+                        {c.totalBookings}
+                      </Badge>
+                    </td>
+                    <td className="p-4 text-muted-foreground">{c.lastBooking}</td>
+                    <td className="p-4 text-right font-mono font-bold text-gold">
+                      Rp {c.totalSpent.toLocaleString()}
+                    </td>
+                    <td className="p-4 text-center">
+                      <Button 
+                        size="sm" 
+                        variant="ghost" 
+                        className={`hover:text-gold ${clientNotes[c.whatsapp] ? 'text-gold' : 'text-zinc-600'}`}
+                        onClick={() => {
+                          setNoteContent(clientNotes[c.whatsapp] || '');
+                          setShowNotes({ open: true, client: c });
+                        }}
+                      >
+                        <FileText className="w-4 h-4" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {clients.length === 0 && (
+              <div className="py-20 text-center text-muted-foreground">
+                No clients found in the database.
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>
+    );
+  };
 
   const AdminView = () => {
     const today = format(new Date(), 'yyyy-MM-dd');
@@ -387,49 +891,92 @@ export default function App() {
           <Tabs defaultValue="queue" className="w-full">
             <TabsList className="bg-black border border-[#333] p-1 rounded-sm">
               <TabsTrigger value="queue" className="data-[state=active]:bg-gold data-[state=active]:text-black rounded-sm uppercase text-xs font-bold px-6">Queue</TabsTrigger>
+              <TabsTrigger value="clients" className="data-[state=active]:bg-gold data-[state=active]:text-black rounded-sm uppercase text-xs font-bold px-6">Clients</TabsTrigger>
               <TabsTrigger value="stats" className="data-[state=active]:bg-gold data-[state=active]:text-black rounded-sm uppercase text-xs font-bold px-6">Analytics</TabsTrigger>
               <TabsTrigger value="history" className="data-[state=active]:bg-gold data-[state=active]:text-black rounded-sm uppercase text-xs font-bold px-6">History</TabsTrigger>
             </TabsList>
             
             <TabsContent value="queue" className="space-y-6 pt-6">
-              <h3 className="sidebar-title">Active Queue ({pendingBookings.length})</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-8">
+                <div className="space-y-6">
+                  <h3 className="sidebar-title">Active Queue ({pendingBookings.length})</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <AnimatePresence>
-                  {pendingBookings.map((b) => {
-                    const now = new Date();
+                  {pendingBookings.map((b, index) => {
                     const [hours, minutes] = b.time.split(':').map(Number);
                     const bookingTime = setMinutes(setHours(new Date(), hours), minutes);
-                    const isCurrent = isWithinInterval(now, {
-                      start: setMinutes(bookingTime, -15),
-                      end: setMinutes(bookingTime, 45)
+                    const isCurrent = isWithinInterval(currentTime, {
+                      start: bookingTime,
+                      end: addMinutes(bookingTime, b.duration || 30)
                     });
 
                     return (
                       <motion.div
                         key={b.id}
                         initial={{ opacity: 0, scale: 0.95 }}
-                        animate={{ opacity: 1, scale: 1 }}
+                        animate={{ opacity: 1, scale: isCurrent ? 1.05 : 1 }}
                         exit={{ opacity: 0, scale: 0.9 }}
+                        className="relative"
                       >
-                        <Card className={`bg-[#111] border ${isCurrent ? 'border-gold shadow-[0_0_15px_rgba(212,175,55,0.2)]' : 'border-[#333]'} p-4`}>
+                        {isCurrent && (
+                          <div className="absolute -inset-1 bg-gold rounded-sm blur-sm opacity-30 animate-pulse"></div>
+                        )}
+                        <Card className={`relative transition-all duration-500 ${isCurrent ? 'bg-gold border-white shadow-[0_0_30px_rgba(212,175,55,0.4)] ring-1 ring-white/20' : 'bg-[#111] border-[#333]'} p-4`}>
                           <div className="flex justify-between items-start">
                             <div className="space-y-2">
                               <div className="flex items-center gap-2">
-                                <span className="text-2xl font-black text-gold">{b.time}</span>
-                                {isCurrent && <Badge className="bg-gold text-black text-[10px] font-black">NOW</Badge>}
+                                <span className={`text-2xl font-black ${isCurrent ? 'text-black' : 'text-gold'}`}>{b.time}</span>
+                                <Badge variant="outline" className={`text-[10px] ${isCurrent ? 'border-black/30 text-black/70' : 'border-gold/30 text-gold/70'}`}>#{index + 1}</Badge>
+                                {isCurrent && (
+                                  <motion.div
+                                    animate={{ opacity: [1, 0.5, 1] }}
+                                    transition={{ duration: 1.5, repeat: Infinity }}
+                                  >
+                                    <Badge className="bg-black text-gold text-[10px] font-black border-none px-2 uppercase">Current</Badge>
+                                  </motion.div>
+                                )}
                               </div>
-                              <h4 className="font-bold text-lg uppercase tracking-tight">{b.name}</h4>
-                              <p className="text-xs text-muted-foreground uppercase tracking-widest">{b.service}</p>
-                              <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                              <h4 className={`font-black text-xl uppercase tracking-tighter leading-none ${isCurrent ? 'text-black' : 'text-white'}`}>{b.name}</h4>
+                              <p className={`text-xs font-bold uppercase tracking-[0.2em] ${isCurrent ? 'text-black/70' : 'text-gold'}`}>{b.service}</p>
+                              <div className={`flex items-center gap-2 text-[11px] font-medium ${isCurrent ? 'text-black/60' : 'text-zinc-500'}`}>
                                 <Phone className="w-3 h-3" /> {b.whatsapp}
                               </div>
                             </div>
                             <div className="flex flex-col gap-2">
-                              <Button size="sm" onClick={() => updateBookingStatus(b.id, 'completed')} className="bg-green-600 hover:bg-green-700 h-8 w-8 p-0">
-                                <CheckCircle2 className="w-4 h-4" />
+                              <Button 
+                                size="sm" 
+                                variant="outline"
+                                onClick={() => setEditingBooking(b)} 
+                                className={`${isCurrent ? 'border-black/40 text-black hover:bg-black/10' : 'border-zinc-700 text-zinc-400 hover:text-white'} h-9 w-9 p-0`} 
+                                title="Edit"
+                              >
+                                <Edit className="w-4 h-4" />
                               </Button>
-                              <Button size="sm" variant="destructive" onClick={() => updateBookingStatus(b.id, 'no-show')} className="h-8 w-8 p-0">
+                              <Button 
+                                size="sm" 
+                                onClick={() => updateBookingStatus(b.id, 'completed')} 
+                                className={`${isCurrent ? 'bg-black text-gold hover:bg-black/90 shadow-xl scale-110' : 'bg-green-600 hover:bg-green-700'} h-9 w-9 p-0`} 
+                                title="Complete"
+                              >
+                                <CheckCircle2 className="w-5 h-5" />
+                              </Button>
+                              <Button 
+                                size="sm" 
+                                variant={isCurrent ? "secondary" : "destructive"} 
+                                onClick={() => updateBookingStatus(b.id, 'no-show')} 
+                                className={`${isCurrent ? 'bg-black/20 text-black hover:bg-black/30 border-none' : ''} h-9 w-9 p-0`} 
+                                title="No-Show"
+                              >
                                 <XCircle className="w-4 h-4" />
+                              </Button>
+                              <Button 
+                                size="sm" 
+                                variant="outline" 
+                                onClick={() => updateBookingStatus(b.id, 'cancelled')} 
+                                className={`h-9 w-9 p-0 ${isCurrent ? 'border-black/20 text-black hover:bg-black/10' : 'border-red-500 text-red-500 hover:bg-red-500/10'}`} 
+                                title="Cancel"
+                              >
+                                <X className="w-4 h-4" />
                               </Button>
                             </div>
                           </div>
@@ -439,11 +986,51 @@ export default function App() {
                   })}
                 </AnimatePresence>
                 {pendingBookings.length === 0 && (
-                  <div className="col-span-full py-16 text-center text-muted-foreground border-2 border-dashed border-[#222] rounded-lg">
-                    No pending bookings for today.
-                  </div>
+                  <motion.div 
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="col-span-full py-20 text-center text-muted-foreground border-2 border-dashed border-[#222] rounded-sm bg-black/20"
+                  >
+                    <div className="flex flex-col items-center gap-3">
+                      <Scissors className="w-10 h-10 opacity-10" />
+                      <p className="font-display uppercase tracking-widest text-sm">No pending bookings for today.</p>
+                      <p className="text-[10px] opacity-50">New reservations will appear here automatically.</p>
+                    </div>
+                  </motion.div>
                 )}
+                </div>
               </div>
+
+              <div className="space-y-6">
+                  <div className="flex items-center gap-2 text-gold">
+                    <Bell className="w-4 h-4" />
+                    <h3 className="uppercase text-xs font-black tracking-widest">Live Activity</h3>
+                  </div>
+                  <Card className="bg-black/40 border-[#222] p-4 min-h-[400px]">
+                    <div className="space-y-4">
+                      {notifications.length === 0 ? (
+                        <p className="text-[10px] text-zinc-600 uppercase text-center py-10">No recent activity</p>
+                      ) : (
+                        notifications.map(n => (
+                          <motion.div 
+                            key={n.id} 
+                            initial={{ x: 20, opacity: 0 }}
+                            animate={{ x: 0, opacity: 1 }}
+                            className="text-[11px] pb-3 border-b border-[#222] last:border-0"
+                          >
+                            <p className="text-zinc-400 leading-tight">{n.message}</p>
+                            <p className="text-zinc-600 text-[9px] mt-1">{format(n.time, 'HH:mm:ss')}</p>
+                          </motion.div>
+                        ))
+                      )}
+                    </div>
+                  </Card>
+                </div>
+              </div>
+            </TabsContent>
+
+            <TabsContent value="clients">
+              <ClientsView />
             </TabsContent>
 
             <TabsContent value="stats" className="pt-6">
@@ -491,11 +1078,21 @@ export default function App() {
                           <td className="p-4 font-bold uppercase">{b.name}</td>
                           <td className="p-4 text-muted-foreground uppercase">{b.service}</td>
                           <td className="p-4">
-                            <Badge variant="outline" className={`rounded-sm text-[9px] uppercase font-black ${b.status === 'completed' ? 'border-green-500 text-green-500' : b.status === 'no-show' ? 'border-red-500 text-red-500' : 'border-gold text-gold'}`}>
+                            <Badge variant="outline" className={`rounded-sm text-[9px] uppercase font-black ${
+                              b.status === 'completed' ? 'border-green-500 text-green-500' : 
+                              b.status === 'no-show' ? 'border-red-500 text-red-500' : 
+                              b.status === 'cancelled' ? 'border-zinc-500 text-zinc-500' :
+                              'border-gold text-gold'
+                            }`}>
                               {b.status}
                             </Badge>
                           </td>
                           <td className="p-4 text-right font-mono">Rp {b.price.toLocaleString()}</td>
+                          <td className="p-4 text-right">
+                            <Button size="sm" variant="ghost" className="h-8 w-8 p-0 hover:text-gold" onClick={() => setEditingBooking(b)}>
+                              <Edit className="w-4 h-4" />
+                            </Button>
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -509,21 +1106,238 @@ export default function App() {
     );
   };
 
-  const TicketModal = () => (
+  const PolicyModal = () => (
     <AnimatePresence>
-      {showTicket && lastBooking && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/95 backdrop-blur-md">
+      {showPolicy && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md">
           <motion.div 
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.9, opacity: 0 }}
-            className="w-full max-w-sm"
+            className="w-full max-w-md bg-zinc-950 border border-[#333] p-8 rounded-sm shadow-2xl relative"
           >
-            <div className="ticket-preview p-10 space-y-6">
-              <div className="space-y-1">
-                <p className="text-[10px] uppercase tracking-[3px] text-muted-foreground">Priority Pass</p>
-                <div className="font-mono text-3xl text-gold font-black">#{lastBooking.id.slice(-6).toUpperCase()}</div>
+            <button 
+              onClick={() => setShowPolicy(false)}
+              className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            
+            <div className="flex items-center gap-3 mb-6">
+              <AlertTriangle className="w-6 h-6 text-gold" />
+              <h2 className="font-display font-black text-xl uppercase tracking-widest">Cancellation Policy</h2>
+            </div>
+            
+            <div className="space-y-6 text-sm text-zinc-400">
+              <section className="space-y-2">
+                <h4 className="text-gold font-bold uppercase text-xs tracking-wider">1. Cancellation Timing</h4>
+                <p className="leading-relaxed">Cancellations must be made at least **2 hours** before your scheduled appointment time.</p>
+              </section>
+              
+              <section className="space-y-2">
+                <h4 className="text-gold font-bold uppercase text-xs tracking-wider">2. Late Arrival</h4>
+                <p className="leading-relaxed">We provide a **15-minute grace period**. If you arrive more than 15 minutes late, your appointment may be automatically cancelled or given to the next available client.</p>
+              </section>
+              
+              <section className="space-y-2">
+                <h4 className="text-gold font-bold uppercase text-xs tracking-wider">3. No-Show Policy</h4>
+                <p className="leading-relaxed">Failure to show up without prior notification may result in a blacklisting from future online reservations.</p>
+              </section>
+
+              <div className="pt-4 border-t border-[#222]">
+                <p className="text-[10px] italic">Please contact us via WhatsApp if you need to reschedule or have issues arriving on time.</p>
               </div>
+            </div>
+
+            <Button 
+              onClick={() => setShowPolicy(false)}
+              className="w-full bg-gold text-black font-black uppercase mt-8 h-12 rounded-sm"
+            >
+              I Understand
+            </Button>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+
+  const EditBookingModal = () => (
+    <AnimatePresence>
+      {editingBooking && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.9, opacity: 0 }}
+            className="w-full max-w-md bg-zinc-950 border border-[#333] p-8 rounded-sm shadow-2xl relative"
+          >
+            <button 
+              onClick={() => setEditingBooking(null)}
+              className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            
+            <div className="flex items-center gap-3 mb-6">
+              <Edit className="w-6 h-6 text-gold" />
+              <div>
+                <h2 className="font-display font-black text-xl uppercase tracking-widest">Edit Booking</h2>
+                <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-tighter">Client: {editingBooking.name}</p>
+              </div>
+            </div>
+            
+            <form onSubmit={handleUpdateBooking} className="space-y-4">
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase text-gold font-bold">Service</Label>
+                <Select name="service" defaultValue={editingBooking.service} required>
+                  <SelectTrigger className="bg-black border-[#333] text-white">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-zinc-900 border-[#333]">
+                    {SERVICES.map(s => (
+                      <SelectItem key={s.name} value={s.name}>{s.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase text-gold font-bold">Date</Label>
+                  <Input name="date" type="date" defaultValue={editingBooking.date} required className="bg-black border-[#333]" />
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase text-gold font-bold">Time</Label>
+                  <Input name="time" type="time" defaultValue={editingBooking.time} required className="bg-black border-[#333]" />
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <Label className="text-[10px] uppercase text-gold font-bold">Status</Label>
+                <Select name="status" defaultValue={editingBooking.status} required>
+                  <SelectTrigger className="bg-black border-[#333] text-white">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-zinc-900 border-[#333]">
+                    <SelectItem value="pending">Pending</SelectItem>
+                    <SelectItem value="completed">Completed</SelectItem>
+                    <SelectItem value="no-show">No-Show</SelectItem>
+                    <SelectItem value="cancelled">Cancelled</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex gap-3 pt-4">
+                <Button 
+                  type="button"
+                  variant="outline"
+                  onClick={() => setEditingBooking(null)}
+                  className="flex-1 border-[#333] text-muted-foreground uppercase text-xs font-bold"
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  type="submit"
+                  className="flex-1 bg-gold text-black font-black uppercase text-xs"
+                >
+                  Save Changes
+                </Button>
+              </div>
+            </form>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+
+  const NotesModal = () => (
+    <AnimatePresence>
+      {showNotes.open && showNotes.client && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md">
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            exit={{ scale: 0.9, opacity: 0 }}
+            className="w-full max-w-md bg-zinc-950 border border-[#333] p-8 rounded-sm shadow-2xl relative"
+          >
+            <button 
+              onClick={() => setShowNotes({ open: false, client: null })}
+              className="absolute top-4 right-4 text-zinc-500 hover:text-white transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            
+            <div className="flex items-center gap-3 mb-6">
+              <FileText className="w-6 h-6 text-gold" />
+              <div>
+                <h2 className="font-display font-black text-xl uppercase tracking-widest">Client Notes</h2>
+                <p className="text-[10px] text-zinc-500 uppercase font-bold tracking-tighter">{showNotes.client.name} - {showNotes.client.whatsapp}</p>
+              </div>
+            </div>
+            
+            <div className="space-y-4">
+              <textarea 
+                className="w-full h-40 bg-black border border-[#333] p-4 text-sm text-white focus:border-gold outline-none resize-none rounded-sm"
+                placeholder="Add special requests, preferences, or technical notes about this client's hair..."
+                value={noteContent}
+                onChange={(e) => setNoteContent(e.target.value)}
+              />
+              
+              <div className="flex gap-3">
+                <Button 
+                  variant="outline"
+                  onClick={() => setShowNotes({ open: false, client: null })}
+                  className="flex-1 border-[#333] text-muted-foreground uppercase text-xs font-bold h-12"
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  onClick={handleUpdateNote}
+                  className="flex-1 bg-gold text-black font-black uppercase text-xs h-12"
+                >
+                  <Save className="w-4 h-4 mr-2" /> Save Note
+                </Button>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+
+  const TicketModal = () => {
+    const queueNumber = useMemo(() => {
+      if (!lastBooking) return null;
+      const today = lastBooking.date;
+      const todaySorted = bookings
+        .filter(b => b.date === today && b.status === 'pending')
+        .sort((a, b) => a.time.localeCompare(b.time));
+      const index = todaySorted.findIndex(b => b.id === lastBooking.id);
+      return index !== -1 ? index + 1 : null;
+    }, [lastBooking, bookings]);
+
+    return (
+      <AnimatePresence>
+        {showTicket && lastBooking && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/95 backdrop-blur-md">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="w-full max-w-sm"
+            >
+              <div className="ticket-preview p-10 space-y-6">
+                <div className="space-y-1">
+                  <div className="flex justify-between items-start">
+                    <p className="text-[10px] uppercase tracking-[3px] text-muted-foreground">Priority Pass</p>
+                    {queueNumber && (
+                      <div className="bg-gold text-black text-[10px] font-black px-2 py-0.5 rounded-sm">
+                        ANTREAN #{queueNumber}
+                      </div>
+                    )}
+                  </div>
+                  <div className="font-mono text-3xl text-gold font-black">#{lastBooking.id.slice(-6).toUpperCase()}</div>
+                </div>
 
               <div className="space-y-1">
                 <p className="text-[10px] uppercase tracking-widest text-gold font-bold">Customer</p>
@@ -562,7 +1376,8 @@ export default function App() {
         </div>
       )}
     </AnimatePresence>
-  );
+    );
+  };
 
   const AdminLoginModal = () => (
     <AnimatePresence>
@@ -608,7 +1423,7 @@ export default function App() {
                       </Button>
                     </div>
                   ) : (
-                    <Button onClick={signInWithGoogle} className="w-full bg-gold text-black font-black uppercase tracking-widest h-12 rounded-sm">
+                    <Button onClick={handleLogin} className="w-full bg-gold text-black font-black uppercase tracking-widest h-12 rounded-sm">
                       Sign In with Google
                     </Button>
                   )}
@@ -625,26 +1440,31 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-black text-[#F5F5F5] flex flex-col selection:bg-gold selection:text-black">
-      <TopBar />
-      
-      {view === 'customer' ? <CustomerView /> : <AdminView />}
+    <ErrorBoundary>
+      <div className="min-h-screen bg-black text-[#F5F5F5] flex flex-col selection:bg-gold selection:text-black">
+        <TopBar />
+        
+        {view === 'customer' ? <CustomerView /> : <AdminView />}
 
-      <footer className="h-[60px] border-t border-[#222] flex items-center justify-between px-6 md:px-10 bg-black text-[11px] text-[#888]">
-        <div>
-          &copy; 2024 Skull Barber Studio - Premium Grooming. Owner: skullstudio09@gmail.com
-        </div>
-        <button 
-          onClick={() => setShowAdminLogin(true)}
-          className="admin-btn"
-        >
-          Admin Access
-        </button>
-      </footer>
+        <footer className="h-[60px] border-t border-[#222] flex items-center justify-between px-6 md:px-10 bg-black text-[11px] text-[#888]">
+          <div>
+            &copy; 2024 Skull Barber Studio - Premium Grooming. Owner: skullstudio09@gmail.com
+          </div>
+          <button 
+            onClick={() => setShowAdminLogin(true)}
+            className="admin-btn"
+          >
+            Admin Access
+          </button>
+        </footer>
 
-      <TicketModal />
-      <AdminLoginModal />
-      <Toaster position="top-center" theme="dark" richColors />
-    </div>
+        <TicketModal />
+        <NotesModal />
+        <EditBookingModal />
+        <PolicyModal />
+        <AdminLoginModal />
+        <Toaster position="top-center" theme="dark" richColors />
+      </div>
+    </ErrorBoundary>
   );
 }

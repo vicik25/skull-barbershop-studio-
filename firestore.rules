@@ -1,14 +1,35 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /bookings/{bookingId} {
-      allow read: if true;
-      allow create: if request.resource.data.name is string;
-      allow update, delete: if request.auth != null;
+    
+    // Helper to check if user is an authorized admin
+    function isAdmin() {
+      return request.auth != null && 
+             request.auth.token.email_verified == true &&
+             (request.auth.token.email == 'skullstudio09@gmail.com' || 
+              request.auth.token.email == 'viciknopik14@gmail.com');
     }
+
+    match /bookings/{bookingId} {
+      // Anyone can read bookings (for queue display)
+      // Anyone can create a booking
+      allow read, create: if true;
+      
+      // Only admins can update or delete bookings
+      allow update, delete: if isAdmin();
+    }
+
     match /settings/{docId} {
+      // Anyone can read settings (to see if shop is open)
       allow read: if true;
-      allow write: if request.auth != null;
+      
+      // Only admins can modify settings
+      allow write: if isAdmin();
+    }
+
+    match /clientNotes/{whatsapp} {
+      // Only admins can see and edit client notes
+      allow read, write: if isAdmin();
     }
   }
 }
